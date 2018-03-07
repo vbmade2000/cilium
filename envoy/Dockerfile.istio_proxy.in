@@ -1,0 +1,16 @@
+FROM istio/proxy:@ISTIO_VERSION@
+
+# Replace Istio's Envoy binary with Cilium's.
+ADD istio-envoy /usr/local/bin/envoy
+
+# Run envoy as root with the setuid bit in order to give it the CAP_NET_ADMIN
+# capability.
+# Set both pilot-agent and envoy with the group specific to the sidecar
+# processes (1337) and the setgid bit in order to allow the traffic from those
+# processes to be forwarded directly in iptables.
+RUN \
+chgrp 1337 /usr/local/bin/envoy /usr/local/bin/pilot-agent && \
+chmod 6755 /usr/local/bin/envoy && \
+chmod 2755 /usr/local/bin/pilot-agent
+
+ENTRYPOINT ["/usr/local/bin/pilot-agent"]

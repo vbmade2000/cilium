@@ -14,8 +14,16 @@
 
 include ../Makefile.defs
 
-ENVOY_BIN = ./bazel-bin/envoy
-ENVOY_BINS = $(ENVOY_BIN) ./bazel-bin/cilium_integration_test
+CILIUM_ENVOY_BIN = ./bazel-bin/cilium-envoy
+CILIUM_ENVOY_RELEASE_BIN = ./cilium-envoy
+ISTIO_ENVOY_BIN = ./bazel-bin/istio-envoy
+ISTIO_ENVOY_RELEASE_BIN = ./istio-envoy
+ENVOY_BINS = \
+	$(CILIUM_ENVOY_BIN) \
+	$(CILIUM_ENVOY_RELEASE_BIN) \
+	$(ISTIO_ENVOY_BIN) \
+	$(ISTIO_ENVOY_RELEASE_BIN) \
+	./bazel-bin/cilium_integration_test
 CHECK_FORMAT ?= ./bazel-bin/check_format.py.runfiles/envoy/tools/check_format.py
 
 BAZEL ?= $(QUIET) bazel
@@ -25,7 +33,9 @@ BAZEL_ARCHIVE ?= ~/bazel-cache.tar.bz2
 CLANG ?= clang
 CLANG_FORMAT ?= clang-format
 BUILDIFIER ?= buildifier
-STRIP ?= strip
+STRIP ?= $(QUIET) strip
+
+ISTIO_VERSION = 0.7.0-cilium
 
 # Dockerfile builds require special options
 ifdef PKG_BUILD
@@ -35,37 +45,58 @@ all: clean-bins release
 else
 BAZEL_OPTS ?=
 BAZEL_BUILD_OPTS = --experimental_strict_action_env --cxxopt=-Wno-error=maybe-uninitialized
-all: clean-bins envoy api
+all: clean-bins release
 endif
 
 debug: envoy-debug api
 
-release: envoy-release api
+release: $(CILIUM_ENVOY_RELEASE_BIN) api
 
 api: force-non-root Makefile.api
 	$(MAKE) -f Makefile.api all
 
-envoy: force-non-root
+envoy-default: force-non-root
 	@$(ECHO_BAZEL)
-	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) //:envoy
+	-rm -f bazel-out/k8-fastbuild/bin/_objs/cilium-envoy/external/envoy/source/common/common/version_linkstamp.o
+	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) //:cilium-envoy
 
 # Allow root build for release
-$(ENVOY_BIN) envoy-release: force
-	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) -c opt //:envoy
+$(CILIUM_ENVOY_BIN) $(CILIUM_ENVOY_RELEASE_BIN): force-non-root
+	@$(ECHO_BAZEL)
+	-rm -f bazel-out/k8-opt/bin/_objs/cilium-envoy/external/envoy/source/common/common/version_linkstamp.o
+	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) -c opt //:cilium-envoy
+	$(STRIP) -o $(CILIUM_ENVOY_RELEASE_BIN) $(CILIUM_ENVOY_BIN)
+
+# Allow root build for release
+$(ISTIO_ENVOY_BIN) $(ISTIO_ENVOY_RELEASE_BIN): force-non-root
+	@$(ECHO_BAZEL)
+	-rm -f bazel-out/k8-opt/bin/_objs/istio-envoy/external/envoy/source/common/common/version_linkstamp.o
+	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) -c opt //:istio-envoy
+	$(STRIP) -o $(ISTIO_ENVOY_RELEASE_BIN) $(ISTIO_ENVOY_BIN)
+
+Dockerfile.%: Dockerfile.%.in
+	-sed "s/@ISTIO_VERSION@/$(ISTIO_VERSION)/" <$< >$@
+
+docker-istio-proxy: Dockerfile.istio_proxy $(ISTIO_ENVOY_RELEASE_BIN)
+	-docker build -f $< -t cilium/istio_proxy:$(ISTIO_VERSION) .
+
+docker-istio-proxy-debug: Dockerfile.istio_proxy_debug $(ISTIO_ENVOY_RELEASE_BIN)
+	-docker build -f $< -t cilium/istio_proxy_debug:$(ISTIO_VERSION) .
+
+docker-istio-proxy-init: Dockerfile.istio_proxy_init
+	-docker build -f $< -t cilium/istio_proxy_init:$(ISTIO_VERSION) .
 
 envoy-debug: force-non-root
-	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) -c dbg //:envoy
+	@$(ECHO_BAZEL)
+	-rm -f bazel-out/k8-dbg/bin/_objs/cilium-envoy/external/envoy/source/common/common/version_linkstamp.o
+	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) -c dbg //:cilium-envoy
 
 $(CHECK_FORMAT): force-non-root
 	$(BAZEL) $(BAZEL_OPTS) build $(BAZEL_BUILD_OPTS) //:check_format.py
 
 install: force-root
 	$(INSTALL) -m 0755 -d $(DESTDIR)$(BINDIR)
-	$(INSTALL) -m 0755 -T $(ENVOY_BIN) $(DESTDIR)$(BINDIR)/cilium-envoy
-# Strip only non-debug builds
-ifeq "$(findstring -dbg,$(realpath bazel-bin))" ""
-	$(STRIP) $(DESTDIR)$(BINDIR)/cilium-envoy
-endif
+	$(INSTALL) -m 0755 -T $(CILIUM_ENVOY_RELEASE_BIN) $(DESTDIR)$(BINDIR)/cilium-envoy
 
 bazel-archive: force-non-root tests clean-bins
 	-sudo rm -f $(BAZEL_ARCHIVE)
@@ -83,13 +114,16 @@ bazel-restore: $(BAZEL_ARCHIVE)
 # Remove the binaries to get fresh version SHA
 clean-bins: force
 	@$(ECHO_CLEAN) $(notdir $(shell pwd))
-	-$(QUIET) rm -f $(ENVOY_BINS)
+	-$(QUIET) rm -f $(ENVOY_BINS) \
+		Dockerfile.istio_proxy \
+		Dockerfile.istio_proxy_debug \
+		Dockerfile.istio_proxy_init
 
-clean: force
+clean: force clean-bins
 	@$(ECHO_CLEAN) $(notdir $(shell pwd))
 	@echo "Bazel clean skipped, try 'make veryclean' instead."
 
-veryclean: force
+veryclean: force clean-bins
 	-sudo $(BAZEL) $(BAZEL_OPTS) clean
 	-sudo rm -Rf $(BAZEL_CACHE)
 
@@ -108,7 +142,31 @@ debug-tests: force-non-root
 	$(BAZEL) $(BAZEL_OPTS) test $(BAZEL_BUILD_OPTS) -c debug $(BAZEL_TEST_OPTS) //:envoy_binary_test
 	$(BAZEL) $(BAZEL_OPTS) test $(BAZEL_BUILD_OPTS) -c debug $(BAZEL_TEST_OPTS) //:cilium_integration_test
 
-.PHONY: force force-root force-non-root
+.PHONY: \
+	api \
+	bazel-archive \
+	bazel-clean-archive \
+	bazel-restore \
+	check \
+	clean \
+	clean-bins \
+	debug \
+	debug-tests \
+	docker-istio-proxy \
+	docker-istio-proxy-debug \
+	docker-istio-proxy-init \
+	envoy-debug \
+	envoy-default \
+	envoy-release \
+	fix \
+	force \
+	force-non-root \
+	force-root \
+	install \
+	release \
+	tests \
+	veryclean
+
 force :;
 
 force-root:

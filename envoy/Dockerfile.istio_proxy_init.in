@@ -1,0 +1,87 @@
+FROM istio/proxy_init:@ISTIO_VERSION@
+
+RUN \
+apt-get update && \
+apt-get install -y --no-install-recommends \
+	iproute2 && \
+apt-get clean
+
+# Redirect all incoming traffic to the local interface.
+# Use iptables TPROXY instead of REDIRECT for inbound connections.
+# Match OUTPUT traffic against the processes' GID in addition to the UID, to
+# accept traffic from setuid programs.
+
+# The resulting diff is:
+#
+# -# Create a new chain for redirecting inbound and outbound traffic to
+# +# Create a new chain for redirecting outbound traffic to
+#  # the common Envoy port.
+#  iptables -t nat -N ISTIO_REDIRECT                                             -m comment --comment "istio/redirect-common-chain"
+#  iptables -t nat -A ISTIO_REDIRECT -p tcp -j REDIRECT --to-port ${ENVOY_PORT}  -m comment --comment "istio/redirect-to-envoy-port"
+#
+# -# Redirect all inbound traffic to Envoy.
+# -iptables -t nat -A PREROUTING -j ISTIO_REDIRECT                               -m comment --comment "istio/install-istio-prerouting"
+#
+# ...
+#
+#  # Avoid infinite loops. Don't redirect Envoy traffic directly back to
+#  # Envoy for non-loopback traffic.
+#  iptables -t nat -A ISTIO_OUTPUT -m owner --uid-owner ${ENVOY_UID} -j RETURN   -m comment --comment "istio/bypass-envoy"
+# +iptables -t nat -A ISTIO_OUTPUT -m owner --gid-owner ${ENVOY_UID} -j RETURN   -m comment --comment "istio/bypass-envoy"
+#
+# ...
+#
+# -exit 0
+# +# Redirect all inbound traffic to Envoy.
+# +iptables -t mangle -N ISTIO_DIVERT
+# +iptables -t mangle -A ISTIO_DIVERT -j MARK --set-mark 1
+# +iptables -t mangle -A ISTIO_DIVERT -j ACCEPT
+# +iptables -t mangle -A PREROUTING -p tcp -m socket -j ISTIO_DIVERT
+# +
+# +iptables -t mangle -N ISTIO_TPROXY
+# +iptables -t mangle -A ISTIO_TPROXY -p tcp -j TPROXY --tproxy-mark 0x1/0x1 --on-port ${ENVOY_PORT}
+# +iptables -t mangle -A PREROUTING -j ISTIO_TPROXY
+# +
+# +ip -f inet rule add fwmark 1 lookup 100
+# +ip -f inet route add local 0.0.0.0/0 dev lo table 100
+
+# The resulting iptables rules are, for proxy port 15001:
+#
+# iptables -t nat -N ISTIO_OUTPUT
+# iptables -t nat -N ISTIO_REDIRECT
+# iptables -t nat -A OUTPUT -p tcp -m comment --comment "istio/install-istio-output" -j ISTIO_OUTPUT
+# iptables -t nat -A ISTIO_OUTPUT ! -d 127.0.0.1/32 -o lo -m comment --comment "istio/redirect-implicit-loopback" -j ISTIO_REDIRECT
+# iptables -t nat -A ISTIO_OUTPUT -m owner --uid-owner 1337 -m comment --comment "istio/bypass-envoy" -j RETURN
+# iptables -t nat -A ISTIO_OUTPUT -m owner --gid-owner 1337 -m comment --comment "istio/bypass-envoy" -j RETURN
+# iptables -t nat -A ISTIO_OUTPUT -d 127.0.0.1/32 -m comment --comment "istio/bypass-explicit-loopback" -j RETURN
+# iptables -t nat -A ISTIO_OUTPUT -m comment --comment "istio/redirect-default-outbound" -j ISTIO_REDIRECT
+# iptables -t nat -A ISTIO_REDIRECT -p tcp -m comment --comment "istio/redirect-to-envoy-port" -j REDIRECT --to-ports 15001
+# iptables -t mangle -N ISTIO_DIVERT
+# iptables -t mangle -N ISTIO_TPROXY
+# iptables -t mangle -A PREROUTING -p tcp -m socket -j ISTIO_DIVERT
+# iptables -t mangle -A PREROUTING -j ISTIO_TPROXY
+# iptables -t mangle -A ISTIO_DIVERT -j MARK --set-xmark 0x1/0xffffffff
+# iptables -t mangle -A ISTIO_DIVERT -j ACCEPT
+# iptables -t mangle -A ISTIO_TPROXY ! -d 127.0.0.1/32 -p tcp -j TPROXY --on-port 15001 --on-ip 0.0.0.0 --tproxy-mark 0x1/0xffffffff
+
+RUN \
+sed     -e 's/redirecting inbound and outbound/redirecting outbound/' \
+	-e '/^# Redirect all inbound/,/-t nat -A PREROUTING/d' \
+	-e '/^exit /d' \
+	-e 's/^\(.*\)--uid-owner\(.*\)$/\1--uid-owner\2\n\1--gid-owner\2/' \
+	-i /usr/local/bin/prepare_proxy.sh && \
+echo "\
+# Redirect all inbound traffic to Envoy.\n\
+iptables -t mangle -N ISTIO_DIVERT\n\
+iptables -t mangle -A ISTIO_DIVERT -j MARK --set-mark 1\n\
+iptables -t mangle -A ISTIO_DIVERT -j ACCEPT\n\
+iptables -t mangle -A PREROUTING -p tcp -m socket -j ISTIO_DIVERT\n\
+\n\
+iptables -t mangle -N ISTIO_TPROXY\n\
+iptables -t mangle -A ISTIO_TPROXY -p tcp ! -d 127.0.0.1 -j TPROXY --tproxy-mark 0x1/0xffffffff --on-port \${ENVOY_PORT}\n\
+iptables -t mangle -A PREROUTING -j ISTIO_TPROXY\n\
+\n\
+ip -f inet rule add fwmark 1 lookup 100\n\
+ip -f inet route add local 0.0.0.0/0 dev lo table 100" >> /usr/local/bin/prepare_proxy.sh
+
+ENTRYPOINT ["/usr/local/bin/prepare_proxy.sh"]
