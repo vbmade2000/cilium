@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/policy/api"
 	. "github.com/cilium/cilium/test/ginkgo-ext"
 	"github.com/cilium/cilium/test/helpers"
@@ -40,14 +41,15 @@ const (
 	http6Private = "http6_private"
 
 	// Policy files
-	policyJSON         = "policy.json"
-	invalidJSON        = "invalid.json"
-	sampleJSON         = "sample_policy.json"
-	ingressJSON        = "ingress.json"
-	egressJSON         = "egress.json"
-	multL7PoliciesJSON = "Policies-l7-multiple.json"
-	policiesL7JSON     = "Policies-l7-simple.json"
-	policiesL3JSON     = "Policies-l3-policy.json"
+	policyJSON                      = "policy.json"
+	invalidJSON                     = "invalid.json"
+	sampleJSON                      = "sample_policy.json"
+	ingressJSON                     = "ingress.json"
+	egressJSON                      = "egress.json"
+	multL7PoliciesJSON              = "Policies-l7-multiple.json"
+	policiesL7JSON                  = "Policies-l7-simple.json"
+	policiesL3JSON                  = "Policies-l3-policy.json"
+	policiesL3DependentL7EgressJSON = "Policies-l3-dependent-l7-egress.json"
 )
 
 var _ = Describe("RuntimeValidatedPolicyEnforcement", func() {
@@ -502,6 +504,20 @@ var _ = Describe("RuntimeValidatedPolicies", func() {
 		}
 	}
 
+	checkProxyStatistics := func(epID string, reqsFwd, reqsReceived, reqsDenied, respFwd, respReceived int) {
+		epModel := vm.EndpointGet(epID)
+		Expect(epModel).To(Not(BeNil()), "nil model returned for endpoint %s", epID)
+		for _, epProxyStatistics := range epModel.Status.Policy.ProxyStatistics {
+			if epProxyStatistics.Location == models.ProxyStatisticsLocationEgress {
+				ExpectWithOffset(1, epProxyStatistics.Statistics.Requests.Forwarded).To(BeEquivalentTo(reqsFwd), "Unexpected number of forwarded requests to proxy")
+				ExpectWithOffset(1, epProxyStatistics.Statistics.Requests.Received).To(BeEquivalentTo(reqsReceived), "Unexpected number of received requests to proxy")
+				ExpectWithOffset(1, epProxyStatistics.Statistics.Requests.Denied).To(BeEquivalentTo(reqsDenied), "Unexpected number of denied requests to proxy")
+				ExpectWithOffset(1, epProxyStatistics.Statistics.Responses.Forwarded).To(BeEquivalentTo(respFwd), "Unexpected number of forwarded responses from proxy")
+				ExpectWithOffset(1, epProxyStatistics.Statistics.Responses.Received).To(BeEquivalentTo(respReceived), "Unexpected number of received responses from proxy")
+			}
+		}
+	}
+
 	It("L3/L4 Checks", func() {
 		_, err := vm.PolicyImportAndWait(vm.GetFullPath(policiesL3JSON), helpers.HelperTimeout)
 		Expect(err).Should(BeNil())
@@ -631,6 +647,37 @@ var _ = Describe("RuntimeValidatedPolicies", func() {
 		connectivityTest(allRequests, helpers.App2, helpers.Httpd1, true)
 	})
 
+	It("L3-Dependent L7 Egress", func() {
+		_, err := vm.PolicyImportAndWait(vm.GetFullPath(policiesL3DependentL7EgressJSON), helpers.HelperTimeout)
+		Expect(err).Should(BeNil(), "unable to import %s", policiesL3DependentL7EgressJSON)
+
+		endpointIDS, err := vm.GetEndpointsIds()
+		Expect(err).To(BeNil(), "Unable to get IDs of endpoints")
+
+		app3EndpointID, exists := endpointIDS[helpers.App3]
+		Expect(exists).To(BeTrue(), "Expected endpoint ID to exist for %s", helpers.App3)
+
+		connectivityTest(httpRequestsPublic, helpers.App3, helpers.Httpd1, true)
+		checkProxyStatistics(app3EndpointID, 2, 2, 0, 2, 2)
+
+		connectivityTest(httpRequestsPrivate, helpers.App3, helpers.Httpd1, false)
+		checkProxyStatistics(app3EndpointID, 2, 4, 2, 2, 2)
+
+		connectivityTest(httpRequestsPublic, helpers.App3, helpers.Httpd2, true)
+		checkProxyStatistics(app3EndpointID, 4, 6, 2, 4, 4)
+
+		connectivityTest(httpRequestsPrivate, helpers.App3, helpers.Httpd2, true)
+		checkProxyStatistics(app3EndpointID, 6, 8, 2, 6, 6)
+
+		By("Disabling all the policies. All should work")
+
+		status := vm.PolicyDelAll()
+		status.ExpectSuccess()
+		vm.WaitEndpointsReady()
+
+		connectivityTest(allRequests, helpers.App3, helpers.Httpd1, true)
+		connectivityTest(allRequests, helpers.App3, helpers.Httpd2, true)
+	})
 	It("Checks CIDR Policy", func() {
 
 		ipv4OtherHost := "192.168.254.111"
