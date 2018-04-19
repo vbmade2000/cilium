@@ -15,6 +15,7 @@
 package RuntimeTest
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -1391,5 +1392,103 @@ var _ = Describe("RuntimeValidatedPolicyImportTests", func() {
 		By("Checking that policy trace returns allowed verdict without any policies imported")
 		res = vm.Exec(fmt.Sprintf(`cilium policy trace --src-endpoint %s --dst-endpoint %s`, httpd2EndpointID, httpd1EndpointID))
 		Expect(res.Output().String()).Should(ContainSubstring(allowedVerdict), "Policy trace did not contain %s", allowedVerdict)
+	})
+})
+
+var _ = Describe("RuntimeValidatedPolicyDropAllTests", func() {
+	var once sync.Once
+	var logger *logrus.Entry
+	var vm *helpers.SSHMeta
+	var dropAll bool
+
+	initialize := func() {
+		logger = log.WithFields(logrus.Fields{"test": "RuntimeValidatedPolicyDropAllTests"})
+		logger.Info("Starting")
+		vm = helpers.CreateNewRuntimeHelper(helpers.Runtime, logger)
+		areEndpointsReady := vm.WaitEndpointsReady()
+		Expect(areEndpointsReady).Should(BeTrue())
+	}
+
+	BeforeEach(func() {
+		once.Do(initialize)
+		vm.PolicyDelAll()
+		res := vm.SetPolicyEnforcement(helpers.PolicyEnforcementDefault)
+		res.ExpectSuccess("Setting policyEnforcement to default")
+	})
+
+	AfterEach(func() {
+		vm.ValidateNoErrorsOnLogs(CurrentGinkgoTestDescription().Duration)
+		if CurrentGinkgoTestDescription().Failed {
+			vm.ReportFailed()
+		}
+	})
+
+	It("DROP_ALL Ingress Policy test", func() {
+		By("Starting cilium monitor in background to filter DROP requests")
+		ctx, cancel := context.WithCancel(context.Background())
+		res := vm.ExecContext(ctx, "cilium monitor --type drop")
+		defer cancel()
+
+		By("Create an endpoint with no labels to test DROP_ALL")
+		cmdStr := "docker run -dt --name ingressContainer --net=cilium-net tgraf/netperf"
+		vm.Exec(cmdStr).ExpectSuccess("Failed to create docker container")
+
+		endpointCmd := "cilium endpoint list | grep \"waiting-for-identity\" | awk '{ print $1}'"
+		endpointID := strings.TrimSpace(vm.Exec(endpointCmd).GetStdOut())
+		endpointCmd = "cilium endpoint list | grep \"waiting-for-identity\" | awk '{ print $7}'"
+		endpointIP := strings.TrimSpace(vm.Exec(endpointCmd).GetStdOut())
+
+		By("Testing endpoint lxc_config.h for DROP_ALL")
+
+		lxcCmd := fmt.Sprintf("sudo cat /var/run/cilium/state/%s/lxc_config.h | grep 'DROP_ALL'", endpointID)
+
+		dropAll = false
+		if strings.TrimSpace(vm.Exec(lxcCmd).GetStdOut()) == "#define DROP_ALL" {
+			dropAll = true
+		}
+
+		Expect(dropAll).Should(BeTrue(), "DROP_ALL failed for ingress. lxc_config.h does not contain the DROP_ALL macro")
+
+		By("Testing ingress with ping from localhost to endpoint with no labels")
+		lxcCmd = fmt.Sprintf("ping %s", endpointIP)
+		vm.Exec(lxcCmd)
+
+		By("Testing cilium monitor drop")
+		err := res.WaitUntilMatch("drop (Policy denied (L3))")
+		Expect(err).To(BeNil(), "DROP all on egress failed.")
+
+		vm.ContainerRm("ingressContainer").ExpectSuccess("Container server cannot be deleted")
+
+	})
+
+	It("DROP_ALL Egress Policy test", func() {
+		By("Starting cilium monitor in background to filter DROP requests")
+		ctx, cancel := context.WithCancel(context.Background())
+		res := vm.ExecContext(ctx, "cilium monitor --type drop")
+		defer cancel()
+
+		By("Create an endpoint with no labels to test DROP_ALL")
+		cmdStr := "docker run -dt --name egressContainer --net=cilium-net tgraf/netperf ping 8.8.8.8"
+		vm.Exec(cmdStr).ExpectSuccess("Failed to create docker container")
+
+		endpointCmd := "cilium endpoint list | grep \"waiting-for-identity\" | awk '{ print $1}'"
+		endpointID := strings.TrimSpace(vm.Exec(endpointCmd).GetStdOut())
+
+		By("Testing endpoint lxc_config.h for DROP_ALL")
+
+		lxcCmd := fmt.Sprintf("sudo cat /var/run/cilium/state/%s/lxc_config.h | grep 'DROP_ALL'", endpointID)
+
+		dropAll = false
+		if strings.TrimSpace(vm.Exec(lxcCmd).GetStdOut()) == "#define DROP_ALL" {
+			dropAll = true
+		}
+
+		Expect(dropAll).Should(BeTrue(), "DROP_ALL failed for egress. lxc_config.h does not contain the DROP_ALL macro")
+
+		By("Testing cilium monitor drop")
+		err := res.WaitUntilMatch("drop (Policy denied (L3))")
+		Expect(err).To(BeNil(), "DROP all on egress failed.")
+
+		vm.ContainerRm("egressContainer").ExpectSuccess("Container server cannot be deleted")
 	})
 })
